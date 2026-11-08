@@ -1,0 +1,5 @@
+# Cargo build outputs
+target/
+
+# Local IDE settings
+.idea/
