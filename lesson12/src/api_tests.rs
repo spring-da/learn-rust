@@ -1,0 +1,128 @@
+use super::*;
+use axum::{body::{Body, to_bytes}, http::Request};
+use serde_json::{Value, json};
+use tower::ServiceExt;
+
+async fn test_router() -> (tempfile::TempDir, Arc<SqliteUserRepository>, Router) {
+    let directory = tempfile::tempdir().unwrap();
+    let repo = Arc::new(SqliteUserRepository::open(&directory.path().join("api.db")).await.unwrap());
+    let router = app(Arc::clone(&repo));
+    (directory, repo, router)
+}
+
+async fn request(router: &Router, method: &str, path: &str, content_type: Option<&str>, body: String) -> Response {
+    request_with_key(router, method, path, content_type, body, Some("test-key")).await
+}
+
+async fn request_with_key(router: &Router, method: &str, path: &str, content_type: Option<&str>, body: String, key: Option<&str>) -> Response {
+    let mut builder = Request::builder().method(method).uri(path);
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    if let Some(key) = key {
+        builder = builder.header("idempotency-key", key);
+    }
+    router.clone().oneshot(builder.body(Body::from(body)).unwrap()).await.unwrap()
+}
+
+async fn json_body(response: Response) -> Value {
+    assert!(response.headers()[header::CONTENT_TYPE].to_str().unwrap().starts_with("application/json"));
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[tokio::test]
+async fn create_read_and_conflict() {
+    let (_directory, repo, router) = test_router().await;
+    let created = request(&router, "POST", "/users", Some("application/json"), json!({"name":"  Alice  "}).to_string()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert_eq!(created.headers()[header::LOCATION], "/users/1");
+    assert_eq!(created.headers()["idempotency-replayed"], "false");
+    assert_eq!(json_body(created).await, json!({"id":1,"name":"Alice","points":0}));
+    let fetched = request(&router, "GET", "/users/1", None, String::new()).await;
+    assert_eq!(fetched.status(), StatusCode::OK);
+    assert_eq!(json_body(fetched).await, json!({"id":1,"name":"Alice","points":0}));
+    let replay = request(&router, "POST", "/users", Some("application/json"), json!({"initial_points":0,"name":"Alice"}).to_string()).await;
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(replay.headers()["idempotency-replayed"], "true");
+    assert_eq!(replay.headers()[header::LOCATION], "/users/1");
+    assert_eq!(json_body(replay).await, json!({"id":1,"name":"Alice","points":0}));
+    let mismatch = request(&router, "POST", "/users", Some("application/json"), json!({"name":"Alice","initial_points":1}).to_string()).await;
+    assert_eq!(mismatch.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(mismatch).await, json!({"error":"idempotency key was used with different parameters"}));
+    let conflict = request_with_key(&router, "POST", "/users", Some("application/json"), json!({"name":"Alice"}).to_string(), Some("other-key")).await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(conflict).await, json!({"error":"name already exists"}));
+    repo.close().await;
+}
+
+#[tokio::test]
+async fn invalid_idempotency_keys() {
+    let (_directory, repo, router) = test_router().await;
+    let long_key = "k".repeat(65);
+    for key in [None, Some(""), Some("bad key"), Some("bad.key"), Some(long_key.as_str())] {
+        let response = request_with_key(&router, "POST", "/users", Some("application/json"), json!({"name":"Alice"}).to_string(), key).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["error"], "Idempotency-Key must be 1-64 ASCII letters, digits, '-' or '_'");
+    }
+    let response = router.clone().oneshot(Request::builder()
+        .method("POST").uri("/users")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("idempotency-key", "one").header("idempotency-key", "two")
+        .body(Body::from(r#"{"name":"Alice"}"#)).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    repo.close().await;
+}
+
+#[tokio::test]
+async fn invalid_create_requests() {
+    let (_directory, repo, router) = test_router().await;
+    let cases = vec![
+        (None, String::from(r#"{"name":"Alice"}"#), 415),
+        (Some("text/plain"), String::from(r#"{"name":"Alice"}"#), 415),
+        (Some("application/json"), String::new(), 400),
+        (Some("application/json"), String::from(r#"{"name":"#), 400),
+        (Some("application/json"), String::from("null"), 400),
+        (Some("application/json"), String::from("[]"), 400),
+        (Some("application/json"), String::from(r#"["Alice"]"#), 400),
+        (Some("application/json"), json!({"name":123}).to_string(), 400),
+        (Some("application/json"), json!({"name":"Alice","initial_points":"bad"}).to_string(), 400),
+        (Some("application/json"), String::from(r#"{"name":"Alice","initial_points":9223372036854775808}"#), 400),
+        (Some("application/json"), json!({"name":"Alice","initial_points":1.5}).to_string(), 400),
+        (Some("application/json"), json!({"name":"Alice","role":"admin"}).to_string(), 400),
+        (Some("application/json"), String::from(r#"{"name":"Alice"} {"name":"Bob"}"#), 400),
+        (Some("application/json"), String::from("{}"), 422),
+        (Some("application/json"), json!({"name":null}).to_string(), 422),
+        (Some("application/json"), json!({"name":"   "}).to_string(), 422),
+        (Some("application/json"), json!({"name":"A"}).to_string(), 422),
+        (Some("application/json"), json!({"name":"a".repeat(41)}).to_string(), 422),
+        (Some("application/json"), json!({"name":"a".repeat(1500)}).to_string(), 413),
+    ];
+    for (content_type, body, status) in cases {
+        let response = request(&router, "POST", "/users", content_type, body.clone()).await;
+        assert_eq!(response.status().as_u16(), status, "content_type={content_type:?}, body={body}");
+        assert!(json_body(response).await["error"].is_string());
+    }
+    let created = request(&router, "POST", "/users", Some("application/json"), json!({"name":"学习"}).to_string()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert_eq!(json_body(created).await, json!({"id":1,"name":"学习","points":0}));
+    repo.close().await;
+}
+
+#[tokio::test]
+async fn registration_rollback_through_http() {
+    let (_directory, repo, router) = test_router().await;
+    let failed = request(&router, "POST", "/users", Some("application/json"), json!({"name":"Recoverable","initial_points":-1}).to_string()).await;
+    assert_eq!(failed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(json_body(failed).await, json!({"error":"initial points must be non-negative"}));
+    let retry = request(&router, "POST", "/users", Some("application/json"), json!({"name":"Recoverable","initial_points":50}).to_string()).await;
+    assert_eq!(retry.status(), StatusCode::CREATED);
+    let location = retry.headers()[header::LOCATION].to_str().unwrap().to_owned();
+    let user = json_body(retry).await;
+    assert_eq!(user["name"], "Recoverable");
+    assert_eq!(user["points"], 50);
+    let fetched = request(&router, "GET", &location, None, String::new()).await;
+    assert_eq!(fetched.status(), StatusCode::OK);
+    assert_eq!(json_body(fetched).await, user);
+    repo.close().await;
+}
