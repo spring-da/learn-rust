@@ -1,0 +1,10 @@
+[package]
+name = "lesson22"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[[bench]]
+name = "membership"
+harness = false
